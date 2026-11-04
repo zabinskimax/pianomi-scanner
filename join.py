@@ -13,7 +13,10 @@ It also puts right what homr misreads in a way the score itself gives away:
   it then sits down among the left hand's notes: they're moved back up.
   Other clef changes of that shape are only flagged;
 - a voice lasting half as long again as the bar's other voices, in equal
-  notes by threes, is triplets homr read as plain notes;
+  notes by threes, is triplets homr read as plain notes, and so is a bar whose
+  notes are mostly of one short length, in threes, reaching half as far again
+  as a voice of longer notes lasts: the bar's notes go back to two thirds of
+  where homr put them;
 - a time signature homr writes at the top of a page that only restates the
   bar length, or that the bars after it don't fill, is replaced by the one
   they do fill.
@@ -375,13 +378,13 @@ def fix_triplets(bars: list[Bar]) -> set[int]:
     how long the bar is: a hand whose notes are a few of a run shared with the
     other hand stops early without the run being triplets.
 
-    homr also puts the other hand's notes where they stand under the plain
-    notes it misread, half as far again into the bar, and it shares a run of
-    triplets out among voices of both staves (the Moonlight Sonata): then the
-    whole bar is squeezed (`_triplet_bar`).
+    homr also puts the bar's other notes where they stand under the plain
+    notes it misread, half as far again into the bar, so they're moved back
+    (`_squeeze`). And it shares a run of triplets out among voices of both
+    staves (the Moonlight Sonata): then every note of the run's length is
+    made triplets (`_triplet_bar`).
     """
-    found: dict[int, set[tuple[str, str]]] = {}
-    squeezed: dict[int, tuple[int, int]] = {}
+    found: dict[int, tuple[int, int, set[tuple[str, str]] | None]] = {}
     for i, bar in enumerate(bars):
         spans: dict[tuple[str, str], int] = {}
         played: dict[tuple[str, str], int] = {}
@@ -395,20 +398,22 @@ def fix_triplets(bars: list[Bar]) -> set[int]:
                 played[key] = played.get(key, 0) + dur
             if n.find("chord") is None and n.find("rest") is None:
                 lengths.setdefault(key, []).append(dur)
-        voices = set()
+        voices: set[tuple[str, str]] = set()
+        length = short = 0
         for key, span in spans.items():
             # Against any other voice: homr's other voices don't always fill the bar either.
             others = {s for k, s in spans.items() if k != key and s and played.get(k) == s}
             durs = lengths.get(key, [])
             if any(2 * span == 3 * s for s in others) and durs and len(set(durs)) == 1 and len(durs) % 3 == 0:
                 voices.add(key)
+                length, short = max(length, 2 * span // 3), durs[0]
         if voices:
-            found[i] = voices
+            found[i] = (length, short, voices)
         else:
             whole = _triplet_bar(bar.el)
             if whole:
-                squeezed[i] = whole
-    if not found and not squeezed:
+                found[i] = (*whole, None)
+    if not found:
         return set()
     # Three times the divisions everywhere, so two thirds of any length is whole.
     for bar in bars:
@@ -416,11 +421,9 @@ def fix_triplets(bars: list[Bar]) -> set[int]:
             el.text = str(int(el.text) * 3)
         for el in bar.el.iter("duration"):
             el.text = str(int(el.text) * 3)
-    for i, voices in found.items():
-        _as_triplets(bars[i].el, voices)
-    for i, (length, short) in squeezed.items():
-        _squeeze(bars[i].el, length * 3, short * 3)
-    return set(found) | set(squeezed)
+    for i, (length, short, voices) in found.items():
+        _squeeze(bars[i].el, length * 3, short * 3, voices)
+    return set(found)
 
 
 def _steady(notes: list[tuple[int, ET.Element]], scale: Fraction) -> int | None:
@@ -438,11 +441,11 @@ def _steady(notes: list[tuple[int, ET.Element]], scale: Fraction) -> int | None:
 def _triplet_bar(m: ET.Element) -> tuple[int, int] | None:
     """
     A bar of triplets homr read as plain notes and spread over several voices:
-    its notes are mostly of one short length, and they reach half as far again
-    as the bar lasts. How long the bar lasts is said by a voice without that
-    length that runs without gaps, as it stands or (homr having placed it
-    under the stretched notes) with its notes at two thirds of where they
-    stand: the bar's length and the short length, or None.
+    its notes are mostly of one short length, in threes, and they reach half
+    as far again as the bar lasts. How long the bar lasts is said by a voice
+    without that length that runs without gaps, as it stands or (homr having
+    placed it under the stretched notes) with its notes at two thirds of where
+    they stand: the bar's length and the short length, or None.
     """
     timed = [(at, n) for at, n in _timed(m) if n.find("grace") is None]
     heads = [(at, n) for at, n in timed if n.find("chord") is None]
@@ -450,7 +453,7 @@ def _triplet_bar(m: ET.Element) -> tuple[int, int] | None:
     if not durs:
         return None
     short, count = Counter(durs).most_common(1)[0]
-    if count < 6 or 2 * count < len(durs) or short <= 0:
+    if count < 6 or count % 3 or 2 * count < len(durs) or short <= 0:
         return None
     reach = max(at + int(n.findtext("duration") or 0) for at, n in heads)
     by_voice: dict[tuple[str, str], list[tuple[int, ET.Element]]] = {}
@@ -468,63 +471,33 @@ def _triplet_bar(m: ET.Element) -> tuple[int, int] | None:
     return (max(lengths), short) if lengths else None
 
 
-def _squeeze(m: ET.Element, length: int, short: int) -> None:
+def _squeeze(m: ET.Element, length: int, short: int, voices: set[tuple[str, str]] | None) -> None:
     """
-    Every note and rest of the bar at two thirds of where it stands, the short
-    ones made triplets; a longer one ends where the next of its voice starts,
-    or at the barline.
+    The bar written again voice by voice, every note and rest at two thirds of
+    where it stands, except in a voice that already runs without gaps from the
+    bar's start; the notes of `voices`, and the notes `short` long of a voice
+    holding notes of the run, made triplets, on the triplets' beat; the others
+    keep their length, up to the barline. (homr puts notes of the run in the
+    melody's voice, so a melody note can't end where the next of its voice
+    starts.)
     """
-    timed = _timed(m)
-    first = next(i for i, c in enumerate(m) if c.tag in ("note", "backup", "forward"))
-    lead, rest = list(m)[:first], [c for c in list(m)[first:] if c.tag not in ("note", "backup", "forward")]
-    by_voice: dict[tuple[str, str], list[tuple[int, int, ET.Element]]] = {}
-    for order, (at, n) in enumerate(timed):
-        by_voice.setdefault(_voice(n), []).append((at * 2 // 3, order, n))
-    for c in list(m):
-        m.remove(c)
-    m.extend(lead)
-    cursor = 0
-    for k, notes in enumerate(by_voice.values()):
-        if k and cursor:
-            ET.SubElement(ET.SubElement(m, "backup"), "duration").text = str(cursor)
-        cursor = 0
-        notes.sort(key=lambda x: (x[0], x[1]))
-        starts = sorted({at for at, _, n in notes if n.find("chord") is None and n.find("grace") is None})
-        head, triplet = 0, False
-        for at, _, n in notes:
-            d = n.find("duration")
-            if n.find("grace") is not None:
-                m.append(n)
-                continue
-            if n.find("chord") is None:
-                head = int(d.text) if d is not None else 0
-                triplet = head == short
-                if triplet:
-                    head = head * 2 // 3
-                else:
-                    later = next((s for s in starts if s > at), length)
-                    head = max(1, min(head, later - at, length - at))
-                if at > cursor:
-                    ET.SubElement(ET.SubElement(m, "forward"), "duration").text = str(at - cursor)
-                elif at < cursor:
-                    ET.SubElement(ET.SubElement(m, "backup"), "duration").text = str(cursor - at)
-                cursor = at + head
-            if triplet:
-                _mark_triplet(n)
-            if d is not None:
-                d.text = str(head)  # a chord's notes last as long as its first
-            m.append(n)
-    m.extend(rest)
-
-
-def _as_triplets(m: ET.Element, voices: set[tuple[str, str]]) -> None:
-    """Write the bar again voice by voice, those voices at two thirds of their lengths, marked 3:2."""
     timed = _timed(m)
     first = next(i for i, c in enumerate(m) if c.tag in ("note", "backup", "forward"))
     lead, rest = list(m)[:first], [c for c in list(m)[first:] if c.tag not in ("note", "backup", "forward")]
     by_voice: dict[tuple[str, str], list[tuple[int, int, ET.Element]]] = {}
     for order, (at, n) in enumerate(timed):
         by_voice.setdefault(_voice(n), []).append((at, order, n))
+    # A voice whose short notes stand on the misread notes' beat holds notes of the run; plain
+    # notes against the triplets (two against three) stand between them as often as on them.
+    run = set(voices or ())
+    for key, notes in by_voice.items():
+        starts = [at for at, _, n in notes if n.find("chord") is None and int(n.findtext("duration") or 0) == short]
+        if starts and 2 * sum(1 for at in starts if at % short == 0) > len(starts):
+            run.add(key)
+
+    def triplet(key: tuple[str, str], n: ET.Element) -> bool:
+        return key in run and (voices is not None and key in voices or int(n.findtext("duration") or 0) == short)
+
     for c in list(m):
         m.remove(c)
     m.extend(lead)
@@ -533,19 +506,36 @@ def _as_triplets(m: ET.Element, voices: set[tuple[str, str]]) -> None:
         if k and cursor:
             ET.SubElement(ET.SubElement(m, "backup"), "duration").text = str(cursor)
         cursor = 0
-        for at, _, n in sorted(notes, key=lambda x: (x[0], x[1])):
-            if key in voices:
+        kept = not any(triplet(key, n) for _, _, n in notes) and _steady([(at, n) for at, _, n in notes], Fraction(1)) is not None
+        placed = []
+        for at, order, n in notes:
+            if not kept:
                 at = at * 2 // 3
-                d = n.find("duration")
-                if d is not None:
-                    d.text = str(int(d.text) * 2 // 3)
+                step = int(n.findtext("duration") or 0) * 2 // 3
+                if triplet(key, n) and step and at % step:
+                    # A note of the run homr put after a dotted one in the melody's voice: on to the next of its beat.
+                    at += step - at % step
+            placed.append((at, order, n))
+        head, made = 0, False
+        for at, _, n in sorted(placed, key=lambda x: (x[0], x[1])):
+            d = n.find("duration")
+            if n.find("grace") is not None:
+                m.append(n)
+                continue
+            if n.find("chord") is None:
+                head = int(d.text) if d is not None else 0
+                made = triplet(key, n)
+                head = head * 2 // 3 if made else max(1, min(head, length - at))
+                if at > cursor:
+                    ET.SubElement(ET.SubElement(m, "forward"), "duration").text = str(at - cursor)
+                elif at < cursor:
+                    ET.SubElement(ET.SubElement(m, "backup"), "duration").text = str(cursor - at)
+                cursor = at + head
+            if made:
                 _mark_triplet(n)
-            if n.find("chord") is None and at > cursor:
-                ET.SubElement(ET.SubElement(m, "forward"), "duration").text = str(at - cursor)
-                cursor = at
+            if d is not None:
+                d.text = str(head)  # a chord's notes last as long as its first
             m.append(n)
-            if n.find("chord") is None and n.find("grace") is None:
-                cursor = at + int(n.findtext("duration") or 0)
     m.extend(rest)
 
 

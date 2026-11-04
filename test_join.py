@@ -12,6 +12,7 @@ import sys
 import time
 import unittest
 import xml.etree.ElementTree as ET
+from fractions import Fraction
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -275,6 +276,79 @@ class TripletTest(unittest.TestCase):
         bars = self.piece(tone("C5", 2) + self.eighths("D5 E5 F5 G5 A5 B5 C5 D5 E5 F5"))
         self.assertEqual(bars[0].findtext("attributes/divisions"), "2")
         self.assertIsNone(bars[0].find(".//time-modification"))
+
+    def test_the_other_hand_goes_back_to_where_it_stands_under_the_triplets(self) -> None:
+        # The Moonlight Sonata: homr puts the left hand's second half note under the 7th eighth it misread, so it
+        # stands on beat 3 with a gap before it, where the half note before it ends on beat 2.
+        right = self.eighths("G#3 C#4 E4 " * 4)
+        left = "<backup><duration>12</duration></backup>" + tone("C#3", 4, 2) + fwd(2) + tone("B2", 4, 2)
+        start = attrs(4, (3, 2), ("G", "F"), first=True)
+        bars = measures(join_pages([page([start + right + left] + [right + left] * 3)]).xml)
+        self.assertEqual(starts(bars[0], 2), [(0, 2, False), (2, 2, False)])
+        self.assertEqual(starts(bars[0], 1)[:4], [(0, Fraction(1, 3), True), (Fraction(1, 3), Fraction(1, 3), True), (Fraction(2, 3), Fraction(1, 3), True), (1, Fraction(1, 3), True)])
+        self.assertEqual(signatures(bars[0], "time"), ["4/4"])
+
+    def test_a_run_shared_out_among_voices_of_both_staves_becomes_triplets(self) -> None:
+        # The Moonlight Sonata again, at 4 divisions (an eighth is 2): the run's first half on the bottom staff,
+        # its second half on the top one, beside the tune's dotted eighth on beat 4; the bass a whole note. homr
+        # reads the run as plain eighths, half as far again into the bar, and writes some of it in the tune's
+        # voice, its last note straight after the dotted eighth.
+        top = fwd(12) + note("G", 3, 2) + note("C", 4, 2) + note("E", 4, 2) + note("G", 4, 3) + note("E", 4, 2)
+        middle = "<backup><duration>23</duration></backup>" + fwd(18) + note("G", 3, 2, 1, 2) + note("C", 4, 2, 1, 2)
+        run = "<backup><duration>22</duration></backup>" + "".join(note(s, o, 2, 2, 2) for s, o in [("G", 3), ("C", 4), ("E", 4)] * 2)
+        bass = "<backup><duration>12</duration></backup>" + note("C", 2, 16, 2, 6)
+        start = attrs(4, (3, 2), ("G", "F"), first=True).replace("<divisions>2</divisions>", "<divisions>4</divisions>")
+        bar = top + middle + run + bass
+        bars = measures(join_pages([page([start + bar] + [bar] * 3)]).xml)
+        bottom = starts(bars[0], 2)
+        self.assertEqual([s for s, _, t in bottom if t], [Fraction(k, 3) for k in range(6)])
+        self.assertIn((0, 4, False), bottom)  # the bass keeps its whole note
+        upper = starts(bars[0], 1)
+        self.assertEqual([s for s, _, t in upper if t], [Fraction(k, 3) for k in range(6, 12)])
+        self.assertIn((3, Fraction(3, 4), False), upper)  # the tune's dotted eighth, on beat 4
+        self.assertEqual(signatures(bars[0], "time"), ["4/4"])
+
+    def test_two_against_three_keeps_the_plain_eighths(self) -> None:
+        # Triplets in the right hand against plain eighths in the left: homr puts the eighths where they stand
+        # against the misread triplets, every other one between two of them. They go back to where they were
+        # meant to be, still plain eighths.
+        right = "".join(tone(s, 2) for s in "C5 E5 G5 ".split() * 4)  # at 4 divisions, 2 is an eighth
+        left = "<backup><duration>24</duration></backup>" + (tone("C3", 2, 2) + fwd(1)) * 8
+        bass = "<backup><duration>24</duration></backup>" + note("C", 2, 16, 2, 6)
+        start = attrs(0, (3, 2), ("G", "F"), first=True).replace("<divisions>2</divisions>", "<divisions>4</divisions>")
+        bars = measures(join_pages([page([start + right + left + bass] + [right + left + bass] * 3)]).xml)
+        plain = [x for x in starts(bars[0], 2) if x[1] != 4]
+        self.assertEqual(plain, [(Fraction(k, 2), Fraction(1, 2), False) for k in range(8)])
+        self.assertEqual({t for _, _, t in starts(bars[0], 1)}, {True})
+
+    def test_bars_of_plain_eighths_as_long_as_their_bass_stay(self) -> None:
+        # 6/4 and 12/8: twelve eighths over a bass that lasts the whole bar are no triplets.
+        for time, left in (((6, 4), note("C", 3, 12, 2, 5)), ((12, 8), "".join(note("C", 3, 6, 2, 5) for _ in range(2)))):
+            right = self.eighths("C5 E5 G5 " * 4)
+            start = attrs(0, time, ("G", "F"), first=True)
+            bars = measures(join_pages([page([start + right + "<backup><duration>12</duration></backup>" + left] * 4)]).xml)
+            self.assertIsNone(bars[0].find(".//time-modification"), time)
+            self.assertEqual(bars[0].findtext("attributes/divisions"), "2", time)
+
+
+def fwd(d: int) -> str:
+    return f"<forward><duration>{d}</duration></forward>"
+
+
+def starts(m: ET.Element, staff: int, divisions: int | None = None) -> list[tuple[Fraction, Fraction, bool]]:
+    """Each note of a staff in the bar: where it starts and how long it lasts, in quarters, and whether it's a triplet."""
+    div = divisions or int(m.findtext("attributes/divisions") or 1)
+    out, pos, last = [], 0, 0
+    for el in m:
+        if el.tag in ("backup", "forward"):
+            pos += int(el.findtext("duration")) * (-1 if el.tag == "backup" else 1)
+        elif el.tag == "note":
+            at = last if el.find("chord") is not None else pos
+            if el.findtext("staff") == str(staff):
+                out.append((Fraction(at, div), Fraction(int(el.findtext("duration")), div), el.find("time-modification") is not None))
+            if el.find("chord") is None:
+                last, pos = pos, pos + int(el.findtext("duration"))
+    return sorted(out)
 
 
 class TimeTest(unittest.TestCase):
