@@ -26,7 +26,7 @@ import copy
 import os
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 
 import numpy as np
@@ -52,6 +52,8 @@ class Box:
     y0: float
     x1: float
     y1: float
+    # Where barlines were found inside it (homr's lines only).
+    barlines: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -306,12 +308,21 @@ def second_look(
     read_line: Callable[[str], str],
     work_dir: str,
     progress: Callable[[str], None] = lambda _: None,
+    placed: list[Box] | None = None,
+    boxes: list[Box] | None = None,
 ) -> tuple[str, int]:
     """
     The page's reading with the lines homr missed or found in part read again.
     `read_systems` is homr's lines, each its staves as fractions of the page;
     `read_line` reads one image. Gives the reading and how many lines were read again.
+
+    `placed` is where each of homr's lines sits on the page as sent, for the
+    page map (`read_systems` are fractions of the image homr cropped, which
+    can differ); `boxes` is filled with where each line of the result sits:
+    homr's own, and for a line read again the one found here.
     """
+    if boxes is not None:
+        boxes[:] = placed or []
     page = Image.open(page_path).convert("RGB")
     lines = find_lines(np.asarray(page.convert("L")) < DARK)
     if not lines:
@@ -352,4 +363,10 @@ def second_look(
             replacements[i] = best[1]
     if not replacements:
         return page_xml, 0
+    if boxes is not None and placed is not None and len(placed) == len(read):
+        boxes[:] = [
+            box
+            for i in range(len(lines))
+            for box in ([lines[i].box] if i in replacements else [placed[k] for k in range(len(read)) if owners[k] == i])
+        ]
     return splice(page_xml, owners, replacements, len(lines)), len(replacements)

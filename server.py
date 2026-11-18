@@ -52,7 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlsplit
 
-from join import JoinError, join_pages
+from join import JoinError, System, join_pages
 
 MAX_UPLOAD = 200 * 1024 * 1024
 MAX_PAGES = 40
@@ -105,6 +105,10 @@ class Reader:
         self._progress: Callable[[float, str], None] | None = None
         # The lines homr read on the last page: each its staves, as fractions of the page (x0, y0, x1, y1).
         self.systems: list[list[tuple[float, float, float, float]]] = []
+        # The same lines for the page map: x0, y0, x1, y1 and barline xs, fractions of the page as sent.
+        self.found: list[tuple[float, float, float, float, list[float]]] = []
+        self.page_size: tuple[int, int] | None = None
+        self._frame: tuple[int, int, Any] = (1, 1, None)
 
     def load(self) -> None:
         try:
@@ -159,18 +163,57 @@ class Reader:
             @functools.wraps(original)
             def hooked(*args: Any, _original: Any = original, _f: float = fraction, _s: str = next_step, _name: str = name, **kwargs: Any) -> Any:
                 if _name == "parse_staffs" and len(args) >= 3:
-                    self._keep_systems(args[1], args[2].shape)
+                    self._keep_systems(args[1], args[2].shape, kwargs.get("page_to_input_image"))
                 result = _original(*args, **kwargs)
+                if _name == "parse_staffs":
+                    self._keep_barlines(result)
                 if self._progress:
                     self._progress(_f, _s)
                 return result
 
             setattr(self._main, name, hooked)
 
-    def _keep_systems(self, multi_staffs: Any, shape: tuple[int, ...]) -> None:
-        """Where homr found the lines it's about to read, for lines.py's second look."""
+    def _keep_systems(self, multi_staffs: Any, shape: tuple[int, ...], to_input: Callable[[tuple[float, float]], tuple[float, float]] | None = None) -> None:
+        """
+        Where homr found the lines it's about to read: for lines.py's second
+        look, and for the page map (`found`) mapped back through homr's own
+        cropping and resizing to the page as sent.
+        """
         h, w = shape[0], shape[1]
         self.systems = [[(s.min_x / w, s.min_y / h, s.max_x / w, s.max_y / h) for s in ms.staffs] for ms in multi_staffs]
+        self._frame = (*(self.page_size if self.page_size and to_input else (w, h)), to_input)
+        pw, ph = self._frame[:2]
+        at = to_input or (lambda p: p)
+        self.found = []
+        for ms in multi_staffs:
+            corners = [(at((s.min_x, s.min_y)), at((s.max_x, s.max_y))) for s in ms.staffs]
+            self.found.append((
+                min(a[0] for a, _ in corners) / pw,
+                min(a[1] for a, _ in corners) / ph,
+                max(b[0] for _, b in corners) / pw,
+                max(b[1] for _, b in corners) / ph,
+                [],
+            ))
+
+    def _keep_barlines(self, voices: Any) -> None:
+        """
+        The x of each bar's closing barline on each line, from the barlines
+        homr's reading of the top voice placed (their place on the page as sent).
+        Only when its rows are the lines it found.
+        """
+        try:
+            rows: list[list[float]] = [[]]
+            for symbol in voices[0]:
+                if symbol.rhythm == "newline":
+                    rows.append([])
+                elif symbol.rhythm == "barline" and symbol.image_coordinates is not None:
+                    rows[-1].append(symbol.image_coordinates[0] / self._frame[0])
+            if not rows[-1]:
+                rows.pop()
+            if len(rows) == len(self.found):
+                self.found = [(*line[:4], xs) for line, xs in zip(self.found, rows)]
+        except Exception as e:  # noqa: BLE001 (no bar positions; the lines still hold)
+            log("No barlines for the page map:", f"{type(e).__name__}: {e}")
 
     @contextlib.contextmanager
     def _quiet(self):  # type: ignore[no-untyped-def]
@@ -185,6 +228,15 @@ class Reader:
     def read_page(self, image: str, title: bool, progress: Callable[[float, str], None]) -> str:
         self._progress = progress
         self.systems = []
+        self.found = []
+        self.page_size = None
+        try:
+            from PIL import Image
+
+            with Image.open(image) as img:
+                self.page_size = img.size
+        except Exception:  # noqa: BLE001 (the map's frame falls back to homr's own)
+            pass
         try:
             with self._quiet() as said:
                 try:
@@ -224,6 +276,9 @@ class Job:
     skipped: list[int] = field(default_factory=list)
     xml: str | None = None
     check_bars: list[str] = field(default_factory=list)
+    # Where the bars are on the pages, once done (see page_map).
+    page_bars: list[dict[str, Any] | None] = field(default_factory=list)
+    page_lines: list[dict[str, Any]] = field(default_factory=list)
     code: str | None = None
     message: str | None = None
     created: float = field(default_factory=time.time)
@@ -241,6 +296,8 @@ class Job:
             "step": self.step,
             "skipped": self.skipped,
             "checkBars": self.check_bars,
+            "pageBars": self.page_bars,
+            "pageLines": self.page_lines,
             "ahead": queue_position,
             "code": self.code,
             "message": self.message,
@@ -340,6 +397,7 @@ class Jobs:
             return
         n = len(job.pages)
         xmls: list[str] = []
+        placed: list[list[System] | None] = []  # each page's lines, for the page map
         problems: list[PageError] = []
         self.update(job, status="reading", step=f"Reading page 1 of {n}" if n > 1 else "Reading the page")
         for i, page in enumerate(job.pages):
@@ -355,7 +413,9 @@ class Jobs:
 
             try:
                 xml = self.reader.read_page(page, title=i == 0, progress=progress)
-                xmls.append(self.second_look(job, page, xml, prefix))
+                xml, lines = self.second_look(job, page, xml, prefix, i)
+                xmls.append(xml)
+                placed.append(lines)
             except PageError as e:
                 problems.append(e)
                 job.skipped.append(i + 1)
@@ -379,20 +439,31 @@ class Jobs:
             )
             return
         try:
-            joined = join_pages(xmls)
+            joined = join_pages(xmls, systems=placed)
         except JoinError as e:
             self.update(job, status="error", code="NO_MUSIC", message=str(e), finished=time.time())
             return
-        self.update(job, status="done", xml=joined.xml, check_bars=joined.check_bars, step="Done", finished=time.time())
+        page_bars, page_lines = page_map(joined.places)
+        self.update(job, status="done", xml=joined.xml, check_bars=joined.check_bars, page_bars=page_bars, page_lines=page_lines, step="Done", finished=time.time())
         log(f"Scan {job.id}: done in {sum(job.seconds):.0f} s" + (f", pages {job.skipped} skipped" if job.skipped else ""))
         shutil.rmtree(job.folder, ignore_errors=True)
 
-    def second_look(self, job: Job, page: str, xml: str, prefix: str) -> str:
-        """The page with the lines homr missed or found in part read again (lines.py). Any trouble keeps the page as read."""
+    def second_look(self, job: Job, page: str, xml: str, prefix: str, index: int) -> tuple[str, list[System] | None]:
+        """
+        The page with the lines homr missed or found in part read again
+        (lines.py), and where its lines sit on page `index`. Any trouble
+        keeps the page as read.
+        """
         systems = list(self.reader.systems)
+        found = list(self.reader.found)
+        size = self.reader.page_size  # reading a line again changes these
+        placed = found
         try:
             from lines import second_look  # numpy and Pillow: homr's environment
 
+            from lines import Box
+
+            boxes: list[Box] = []
             xml, again = second_look(
                 page,
                 xml,
@@ -400,13 +471,16 @@ class Jobs:
                 lambda line: self.reader.read_page(line, title=False, progress=lambda _f, _s: None),
                 job.folder,
                 lambda step: self.update(job, fraction=0.97, step=f"{prefix}{step}"),
+                [Box(*b[:4], barlines=b[4]) for b in found],
+                boxes,
             )
+            placed = [(b.x0, b.y0, b.x1, b.y1, b.barlines) for b in boxes]
         except Exception as e:  # noqa: BLE001
             log(f"Scan {job.id}: no second look at {os.path.basename(page)} ({type(e).__name__}: {e})")
-            return xml
+            return xml, page_systems(index, found, size)
         if again:
             log(f"Scan {job.id}: {os.path.basename(page)}: {again} {'line' if again == 1 else 'lines'} read again")
-        return xml
+        return xml, page_systems(index, placed, size)
 
     def idle(self, seconds: float) -> bool:
         """Nothing waiting, read or left to collect, and no scan news for this long."""
@@ -464,6 +538,52 @@ def parse_multipart(body: bytes, content_type: str) -> list[tuple[str, str, byte
 
 def is_pdf(data: bytes) -> bool:
     return b"%PDF-" in data[:1024]
+
+
+def page_systems(page: int, boxes: list[tuple[float, float, float, float, list[float]]], size: tuple[int, int] | None) -> list[System] | None:
+    """
+    A page's lines for the page map: fractions of the page as saved, with
+    `with_margin`'s margin taken off, so they are fractions of the page the
+    player sent. None when the page's size isn't known.
+    """
+    if not size:
+        return None
+    w, h = size
+    pad = round(MARGIN * max(w, h) / (1 + 2 * MARGIN))
+    inner_w, inner_h = max(1, w - 2 * pad), max(1, h - 2 * pad)
+
+    def fx(x: float) -> float:
+        return round(min(1.0, max(0.0, (x * w - pad) / inner_w)), 4)
+
+    def fy(y: float) -> float:
+        return round(min(1.0, max(0.0, (y * h - pad) / inner_h)), 4)
+
+    return [System(page, fx(x0), fy(y0), fx(x1), fy(y1), [fx(x) for x in barlines]) for x0, y0, x1, y1, barlines in boxes]
+
+
+def page_map(places: list[Any]) -> tuple[list[dict[str, Any] | None], list[dict[str, Any]]]:
+    """
+    The job's pageBars (one for each bar of the joined score, null where the
+    bar has no known place) and pageLines (the lines they sit on, in order).
+    A bar's x0 and x1 are given only when its line's barlines say them.
+    """
+    lines: list[dict[str, Any]] = []
+    index: dict[int, int] = {}
+    bars: list[dict[str, Any] | None] = []
+    for place in places:
+        if place is None:
+            bars.append(None)
+            continue
+        s = place.system
+        if id(s) not in index:
+            index[id(s)] = len(lines)
+            lines.append({"page": s.page, "x0": s.x0, "x1": s.x1, "y0": s.y0, "y1": s.y1})
+        bar: dict[str, Any] = {"page": s.page, "line": index[id(s)]}
+        if place.x0 is not None and place.x1 is not None:
+            bar["x0"] = round(place.x0, 4)
+            bar["x1"] = round(place.x1, 4)
+        bars.append(bar)
+    return bars, lines
 
 
 def with_margin(img: "Image.Image") -> "Image.Image":

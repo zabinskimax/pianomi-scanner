@@ -157,6 +157,23 @@ class SecondLookTest(unittest.TestCase):
             xml, again = lines.second_look(path, page_xml, systems, lambda _: self.fail("nothing to read again"), tmp)
             self.assertEqual((xml, again), (page_xml, 0))
 
+    def test_says_where_each_line_of_the_result_sits_for_the_page_map(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "page-1.png")
+            page().save(path)
+            systems = [[(100 / W, top / H, 1100 / W, (bottom + 40) / H)] for top, bottom in (STAFF_TOPS[0], STAFF_TOPS[2])]
+            homr_boxes = [lines.Box(0.1, 0.1, 0.9, 0.3, [0.5]), lines.Box(0.1, 0.7, 0.9, 0.9, [0.4])]
+            page_xml = score([measure(note("C", 6), PAGE_ATTRS), measure(note("E", 6), new_line=True)])
+            read_line = lambda _: score([measure(note("D", 6), "<attributes><divisions>2</divisions></attributes>")])  # noqa: E731
+            boxes: list[lines.Box] = []
+            lines.second_look(path, page_xml, systems, read_line, tmp, placed=homr_boxes, boxes=boxes)
+            # Three lines: homr's first, the one read again (found here), homr's last.
+            self.assertEqual(len(boxes), 3)
+            self.assertIs(boxes[0], homr_boxes[0])
+            self.assertIs(boxes[2], homr_boxes[1])
+            self.assertAlmostEqual(boxes[1].y0, 400 / H, places=2)
+            self.assertEqual(boxes[1].barlines, [])
+
 
 if __name__ == "__main__":
     unittest.main()

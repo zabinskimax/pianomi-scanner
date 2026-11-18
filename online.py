@@ -56,7 +56,8 @@ PAGES_PER_HOUR = int(os.environ.get("SCANNER_PAGES_PER_HOUR") or 40)
 PAGES_PER_DAY = int(os.environ.get("SCANNER_PAGES_PER_DAY") or 1500)
 
 # pianomi.app, its Vercel previews, and the app's dev servers.
-ORIGINS = r"^(https://(www\.)?pianomi\.app|https://pianomi(-[a-z0-9-]+)?\.vercel\.app|http://(localhost|127\.0\.0\.1)(:\d+)?)$"
+# capacitor://localhost is the iPhone and iPad app's page (docs/phone-apps.md).
+ORIGINS = r"^(capacitor://localhost|https://(www\.)?pianomi\.app|https://pianomi(-[a-z0-9-]+)?\.vercel\.app|http://(localhost|127\.0\.0\.1)(:\d+)?)$"
 
 
 class Counter(Protocol):

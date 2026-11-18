@@ -70,11 +70,38 @@ class JoinError(Exception):
     """None of the pages had any bars in them."""
 
 
+@dataclass(eq=False)
+class System:
+    """
+    A line of music on a page, as fractions of the page (0-1 from its top
+    left): the staves' extent, and where homr read the bars end.
+    """
+
+    page: int
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    # The x of each bar's closing barline, as homr read them (the last bar's may be missing).
+    barlines: list[float] = field(default_factory=list)
+
+
+@dataclass
+class BarPlace:
+    """Where a joined bar sits: its line, and its own x range when the line's barlines say it."""
+
+    system: System
+    x0: float | None = None
+    x1: float | None = None
+
+
 @dataclass
 class Joined:
     xml: str
     # Bar numbers to check against the sheet music: changed here, or not adding up.
     check_bars: list[str] = field(default_factory=list)
+    # Where each bar (by number - 1) sits on the pages; None where it's not known.
+    places: list[BarPlace | None] = field(default_factory=list)
 
 
 @dataclass
@@ -82,6 +109,7 @@ class Bar:
     el: ET.Element
     page_start: bool = False
     line_start: bool = False
+    system: System | None = None
 
 
 def _staves(part: ET.Element) -> int:
@@ -654,11 +682,66 @@ def bars_to_check(bars: list[Bar], doubtful: set[int]) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
-def join_pages(pages: list[str], title: str | None = None) -> Joined:
-    """One score from the pages' MusicXML, in order. Pages without bars are left out."""
-    parts: list[ET.Element] = []
+# Barlines closer than this (a share of the page's width) are one; a line's last one is its end when this close to it.
+BARLINE_TOUCH = 0.006
+LINE_END = 0.03
+
+
+def bar_edges(system: System, count: int) -> list[tuple[float, float]] | None:
+    """
+    The x range of each of a line's `count` bars from its bars' closing
+    barlines (as homr read them); None unless they fit: one for each bar,
+    or one less when the line's last bar isn't closed (the piece's end).
+    """
+    ends: list[float] = []
+    for x in sorted(system.barlines):
+        if not ends or x - ends[-1] >= BARLINE_TOUCH:
+            ends.append(x)
+    if count == 1:
+        return [(system.x0, system.x1)]
+    near = bool(ends) and system.x1 - ends[-1] <= LINE_END
+    if len(ends) == count and near:
+        ends[-1] = system.x1
+    elif len(ends) == count - 1 and not near:
+        ends.append(system.x1)
+    else:
+        return None
+    starts = [system.x0, *ends[:-1]]
+    return list(zip(starts, ends))
+
+
+def _place(bars: list[Bar]) -> list[BarPlace | None]:
+    """Each bar's line, and its x range where its line's barlines give it."""
+    counts: dict[int, int] = {}
+    for bar in bars:
+        if bar.system is not None:
+            counts[id(bar.system)] = counts.get(id(bar.system), 0) + 1
+    seen: dict[int, int] = {}
+    edges: dict[int, list[tuple[float, float]] | None] = {}
+    out: list[BarPlace | None] = []
+    for bar in bars:
+        system = bar.system
+        if system is None:
+            out.append(None)
+            continue
+        n = seen[id(system)] = seen.get(id(system), -1) + 1
+        if id(system) not in edges:
+            edges[id(system)] = bar_edges(system, counts[id(system)])
+        mine = edges[id(system)]
+        out.append(BarPlace(system, *mine[n]) if mine else BarPlace(system))
+    return out
+
+
+def join_pages(pages: list[str], title: str | None = None, systems: list[list[System] | None] | None = None) -> Joined:
+    """
+    One score from the pages' MusicXML, in order. Pages without bars are left out.
+    `systems` gives each page's lines (one per line of its MusicXML, top to
+    bottom) to say where each bar sits; a page whose lines don't match its
+    bars is left out of that.
+    """
+    parts: list[tuple[ET.Element, list[System] | None]] = []
     first_root: ET.Element | None = None
-    for xml in pages:
+    for k, xml in enumerate(pages):
         try:
             root = ET.fromstring(xml)  # noqa: S314 (homr's own output)
         except ET.ParseError:
@@ -668,11 +751,11 @@ def join_pages(pages: list[str], title: str | None = None) -> Joined:
             continue
         if first_root is None:
             first_root = root
-        parts.append(part)
+        parts.append((part, systems[k] if systems and k < len(systems) else None))
     if first_root is None:
         raise JoinError("No bars were found on any page.")
 
-    staves = max(_staves(p) for p in parts)
+    staves = max(_staves(p) for p, _ in parts)
     score = ET.Element("score-partwise", version="4.0")
     work_title = title if title is not None else (first_root.findtext("work/work-title") or "").strip()
     if work_title:
@@ -685,11 +768,17 @@ def join_pages(pages: list[str], title: str | None = None) -> Joined:
     out = ET.SubElement(score, "part", id="P1")
 
     bars: list[Bar] = []
-    for part in parts:
-        for i, measure in enumerate(part.findall("measure")):
+    for part, lines in parts:
+        measures = part.findall("measure")
+        starts = [i == 0 or m.find("print[@new-system='yes']") is not None for i, m in enumerate(measures)]
+        # One line for each start, or no way to say which bar is on which.
+        match = lines if lines is not None and len(lines) == sum(starts) else None
+        line = -1
+        for i, measure in enumerate(measures):
             m = copy.deepcopy(measure)
             _merge_leading_attributes(m)
-            bars.append(Bar(m, page_start=i == 0, line_start=i == 0 or m.find("print[@new-system='yes']") is not None))
+            line += starts[i]
+            bars.append(Bar(m, page_start=i == 0, line_start=starts[i], system=match[line] if match else None))
     bars = fold_empty_bars(bars)
     changed, unsure = fix_keys_and_clefs(bars, staves)
     changed |= fix_triplets(bars)  # before the time signatures: homr fits them to the triplets it misread
@@ -734,7 +823,7 @@ def join_pages(pages: list[str], title: str | None = None) -> Joined:
             _start(m, staves)
         out.append(m)
 
-    return Joined(ET.tostring(score, encoding="unicode", xml_declaration=True), [str(i + 1) for i in check])
+    return Joined(ET.tostring(score, encoding="unicode", xml_declaration=True), [str(i + 1) for i in check], _place(bars))
 
 
 def _merge_leading_attributes(m: ET.Element) -> None:

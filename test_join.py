@@ -16,8 +16,8 @@ from fractions import Fraction
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from join import JoinError, join_pages  # noqa: E402
-from server import UNCOLLECTED_GRACE, Jobs, log, parse_multipart  # noqa: E402
+from join import JoinError, System, join_pages  # noqa: E402
+from server import UNCOLLECTED_GRACE, Jobs, log, page_map, page_systems, parse_multipart  # noqa: E402
 
 
 def note(step: str, octave: int, dur: int, staff: int = 1, voice: int = 1) -> str:
@@ -450,6 +450,53 @@ class IdleTest(unittest.TestCase):
         self.assertTrue(jobs.idle(1200))
         jobs.touch()
         self.assertFalse(jobs.idle(1200), "asking about a scan counts")
+
+
+class PlacesTest(unittest.TestCase):
+    """Where each joined bar sits on the pages (the page map)."""
+
+    LINE = '<print new-system="yes"/>'
+
+    def two_lines(self) -> str:
+        bar = note("C", 4, 6)
+        return page([GRAND + bar, bar, bar, self.LINE + bar, bar])
+
+    def test_each_bar_gets_its_line_and_x_from_the_closing_barlines(self) -> None:
+        first = System(0, 0.1, 0.1, 0.9, 0.2, [0.3, 0.5, 0.9])  # three bars: one closing barline each
+        second = System(0, 0.1, 0.3, 0.9, 0.4, [0.4])  # two bars, the last one's barline missing
+        places = join_pages([self.two_lines()], systems=[[first, second]]).places
+        self.assertEqual([p.system for p in places], [first] * 3 + [second] * 2)
+        self.assertEqual([(p.x0, p.x1) for p in places[:3]], [(0.1, 0.3), (0.3, 0.5), (0.5, 0.9)])
+        self.assertEqual([(p.x0, p.x1) for p in places[3:]], [(0.1, 0.4), (0.4, 0.9)])
+
+    def test_a_line_whose_barlines_dont_fit_has_no_x(self) -> None:
+        first = System(0, 0.1, 0.1, 0.9, 0.2, [0.3])  # not three for three bars
+        second = System(0, 0.1, 0.3, 0.9, 0.4)
+        places = join_pages([self.two_lines()], systems=[[first, second]]).places
+        self.assertEqual([p.x0 for p in places], [None] * 5)
+        self.assertEqual(places[0].system, first)
+
+    def test_a_page_whose_lines_dont_match_its_bars_has_no_places(self) -> None:
+        only = System(0, 0.1, 0.1, 0.9, 0.2)
+        self.assertEqual(join_pages([self.two_lines()], systems=[[only]]).places, [None] * 5)
+        self.assertEqual(join_pages([self.two_lines()]).places, [None] * 5)
+
+    def test_pages_keep_their_own_number_when_one_is_left_out(self) -> None:
+        a = System(0, 0.1, 0.1, 0.9, 0.2, [0.9])
+        c = System(2, 0.1, 0.1, 0.9, 0.2, [0.9])
+        one = page([GRAND + note("C", 4, 6)])
+        places = join_pages([one, "not xml", one], systems=[[a], None, [c]]).places
+        self.assertEqual([p.system.page for p in places], [0, 2])
+
+    def test_the_job_says_it_in_page_fractions_without_the_margin(self) -> None:
+        a = System(1, 0.2, 0.1, 0.9, 0.2, [0.5, 0.9])
+        bars, lines = page_map(join_pages([page([GRAND + note("C", 4, 6), note("D", 4, 6)])], systems=[[a]]).places)
+        self.assertEqual(lines, [{"page": 1, "x0": 0.2, "x1": 0.9, "y0": 0.1, "y1": 0.2}])
+        self.assertEqual(bars, [{"page": 1, "line": 0, "x0": 0.2, "x1": 0.5}, {"page": 1, "line": 0, "x0": 0.5, "x1": 0.9}])
+        # A page 1000 x 1400 as sent is 1056 x 1456 saved: 2% of 1400, rounded, 28 px each side.
+        (system,) = page_systems(0, [(28 / 1056, 28 / 1456, 1028 / 1056, 1428 / 1456, [528 / 1056])], (1056, 1456))  # type: ignore[misc]
+        self.assertEqual((system.x0, system.y0, system.x1, system.y1, system.barlines), (0.0, 0.0, 1.0, 1.0, [0.5]))
+        self.assertIsNone(page_systems(0, [], None))
 
 
 if __name__ == "__main__":
